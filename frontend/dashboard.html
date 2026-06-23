@@ -2347,6 +2347,7 @@
           <label>API Key</label>
           <input type="password" id="cfg-emb-api-key" placeholder="当前: 加载中…" style="flex:1;" />
           <button type="button" onclick="saveEmbedKey()" title="保存 Key" style="margin-left:8px;padding:0 10px;height:32px;font-size:12px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="key"></i> 保存</button>
+          <button type="button" onclick="testEmbeddingKey()" title="测试向量化连接" style="margin-left:4px;padding:0 10px;height:32px;font-size:12px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="zap"></i> 测试</button>
           <span id="emb-key-msg" style="margin-left:8px;font-size:11px;"></span>
         </div>
         <div class="config-row">
@@ -3198,6 +3199,20 @@ async function testDehydrationKey() {
     msgEl.style.color = 'var(--positive, #9DC880)'; msgEl.innerHTML = _SV.ok + ' ' + esc(d.message || '连接成功');
   } else {
     msgEl.style.color = 'var(--negative)'; msgEl.innerHTML = _SV.err + ' ' + esc(d.error || '连接失败');
+  }
+}
+
+async function testEmbeddingKey() {
+  const msgEl = document.getElementById('emb-key-msg');
+  if (!msgEl) return;
+  msgEl.style.color = 'var(--text-dim)'; msgEl.textContent = '测试中…';
+  const resp = await authFetch('/api/test/embedding', {method: 'POST'});
+  if (!resp) return;
+  const d = await resp.json().catch(() => ({}));
+  if (d.ok) {
+    msgEl.style.color = 'var(--positive, #9DC880)'; msgEl.innerHTML = _SV.ok + ' ' + esc(d.message || '向量化连接成功');
+  } else {
+    msgEl.style.color = 'var(--negative)'; msgEl.innerHTML = _SV.err + ' ' + esc(d.error || '向量化连接失败');
   }
 }
 
@@ -5621,7 +5636,15 @@ loadVersionBadge();
     var logBox  = document.getElementById('ver-log-box');
     var doneEl  = document.getElementById('ver-update-done');
 
-    if (!confirm('确认开始热更新？\n\n请确保已导出记忆备份，更新期间服务会短暂重启（约 10-30 秒）。')) return;
+    // 非 Docker 部署没有 restart 策略：更新后进程会退出但不会自动拉起，需要手动重启。
+    var _di = await loadDeployInfo();
+    var _confirmMsg = '确认开始热更新？\n\n请确保已导出记忆备份，更新期间服务会短暂重启（约 10-30 秒）。';
+    if (_di && _di.is_docker === false) {
+      _confirmMsg = '确认开始热更新？\n\n⚠️ 检测到你不是 Docker 部署：更新完成后服务会自动退出，'
+        + '但只有在你用了进程守护（systemd / pm2 / screen 等）时才会自动重启；'
+        + '否则需要你手动重启服务。\n\n请先导出记忆备份再继续。';
+    }
+    if (!confirm(_confirmMsg)) return;
 
     if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader"></i> 更新中…'; lucide.createIcons(); }
     if (logWrap) logWrap.style.display = '';

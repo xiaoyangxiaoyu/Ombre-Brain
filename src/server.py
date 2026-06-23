@@ -8,8 +8,8 @@ DecayEngine / EmbeddingEngine / ImportEngine，把它们注入 tools._runtime，
 然后以 @mcp.tool() 注册薄封装（真正的实现在 src/tools/<工具>/ 下面）。
 
 关键行为：
-- 启动后暴露 11 个 MCP 工具：breath/hold/grow/trace/anchor/release/
-  pulse/plan/letter_write/letter_read/dream；每个入口 ≤ 10 行，只负责转发
+- 启动后暴露 12 个 MCP 工具：breath/hold/grow/trace/anchor/release/
+  pulse/plan/letter_write/letter_read/dream/I；每个入口 ≤ 10 行，只负责转发
 - 同时开 Dashboard HTTP 服务：@mcp.custom_route() 下的路由都留在本文件
 - 提供会话 / 鉴权 / Webhook / SSE 推送 / 压力表 / heartbeat 等走 HTTP 的能力
 - 企业级细节：CSRF token / rate limit / nonce 去重 / TLS 提示
@@ -19,7 +19,7 @@ DecayEngine / EmbeddingEngine / ImportEngine，把它们注入 tools._runtime，
 - 不写 LLM prompt（dehydrator 负责）
 - 不直接读写桶文件（bucket_manager 负责）
 
-对外暴露：mcp 实例 + 11 个 @mcp.tool() 函数 + 一批 @mcp.custom_route HTTP 接口
+对外暴露：mcp/mcp_extra 两个实例 + 12 个 @mcp*.tool() 函数 + 一批 @mcp.custom_route HTTP 接口
 ========================================
 """
 
@@ -305,9 +305,9 @@ _gh_auto_interval: int = int(_gh_cfg.get("auto_interval_minutes") or 0)
 #
 # iter 2.1：拆成两个 FastMCP 实例 —— 因 claude.ai MCP 连接器存在 5 工具上限。
 #   主 mcp（/mcp）：高频  breath / hold / grow / dream / trace
-#   副 mcp_extra（/mcp-extra）：低频 anchor / release / pulse / plan / letter_write / letter_read
+#   副 mcp_extra（/mcp-extra）：低频 anchor / release / pulse / plan / letter_write / letter_read / I
 # 两个实例共享同一进程、同一 runtime、同一 bucket_mgr；HTTP custom_route（dashboard、API）
-# 全部仍挂在 mcp 主实例上，副实例只承载 6 个 @mcp_extra.tool() 注册。
+# 全部仍挂在 mcp 主实例上，副实例只承载 7 个 @mcp_extra.tool() 注册。
 # 启动段把两个 streamable_http_app() 的 routes 与 lifespan 合并到一个 starlette app，
 # 由同一 uvicorn 进程对外暴露。
 mcp = FastMCP(
@@ -660,8 +660,6 @@ async def auth_set_security_question(request: Request) -> Response:
     answer = body.get("answer", "").strip()
     if not question or not answer:
         return JSONResponse({"error": "问题和答案不能为空"}, status_code=400)
-    if len(answer) < 1:
-        return JSONResponse({"error": "答案不能为空"}, status_code=400)
     _save_security_qa(question, answer)
     return JSONResponse({"ok": True})
 
@@ -682,6 +680,7 @@ async def root_dashboard(request: Request) -> Response:
     """
     from starlette.responses import HTMLResponse
     import os
+    import html as _html
     dashboard_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "frontend",
@@ -698,7 +697,18 @@ async def root_dashboard(request: Request) -> Response:
             html = html.replace(asset, f"{asset}?v={__version__}")
         return HTMLResponse(html)
     except FileNotFoundError:
-        return HTMLResponse("<h1>dashboard.html not found</h1>", status_code=404)
+        # 走到这里 = 部署目录里缺 frontend/dashboard.html。它本应随仓库一起下发
+        # （已纳入 git，未被 .gitignore 排除），所以最常见原因是克隆/部署了旧版本。
+        # 给一条能自解释的提示，避免被误判成「神秘 bug / gitignore 问题」。
+        return HTMLResponse(
+            "<h1>dashboard.html not found</h1>"
+            f"<p>Expected at: <code>{_html.escape(dashboard_path)}</code></p>"
+            "<p>This file ships with the repo (it is committed and NOT git-ignored). "
+            "A missing file almost always means an outdated checkout — "
+            "run <code>git pull origin main</code> / re-clone, or rebuild your Docker image, "
+            "then restart.</p>",
+            status_code=404,
+        )
 
 
 # iter 1.7 §C/§H: serve frontend static assets (icon.svg, favicon.svg, manifest.json)
@@ -1433,9 +1443,10 @@ async def breath_hook(request):
         # top 2 unresolved by score
         unresolved = [b for b in all_buckets
                       if not b["metadata"].get("resolved", False)
-                      and b["metadata"].get("type") not in ("permanent", "feel", "plan", "letter", "self")
+                      and b["metadata"].get("type") not in ("permanent", "feel", "plan", "letter", "self", "i")
                       and not b["metadata"].get("pinned")
-                      and not b["metadata"].get("protected")]
+                      and not b["metadata"].get("protected")
+                      and not b["metadata"].get("dont_surface", False)]
         scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
 
         parts = []
@@ -1502,8 +1513,8 @@ async def breath_hook(request):
         try:
             self_buckets = [
                 b for b in all_buckets
-                if b["metadata"].get("type") == "self"
-                or "__self__" in (b["metadata"].get("tags") or [])
+                if b["metadata"].get("type") == "i"
+                or "__i__" in (b["metadata"].get("tags") or [])
             ]
             if self_buckets:
                 self_buckets.sort(
@@ -1543,9 +1554,10 @@ async def dream_hook(request):
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
             b for b in all_buckets
-            if b["metadata"].get("type") not in ("permanent", "feel", "plan", "letter", "self")
+            if b["metadata"].get("type") not in ("permanent", "feel", "plan", "letter", "self", "i")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and not b["metadata"].get("dont_surface", False)
         ]
         candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
         recent = candidates[:10]
@@ -2742,7 +2754,7 @@ async def api_plans(request: Request) -> Response:
         # 每组按 updated_at 倒序。lambda 是匿名函数；key 函数指定「拿什么排序」
         # `or .. or ""` 堆叠保底：缺字段也不会报 NoneType < str 错
         # iter 1.8: active 列改为 (weight desc, updated_at desc) —— 重的计划在前。
-        # 排序锡是「越靠后越主」：先按 updated_at 倒序的列表上再按 weight 倒序会使 weight 作为主错，
+        # 排序键是「越靠后越主」：先按 updated_at 倒序的列表上再按 weight 倒序会使 weight 作为主键，
         # 所以这里用组合 key。resolved/abandoned 只按 updated_at 倒序。
         groups["active"].sort(
             key=lambda p: (-float(p.get("weight") or 0.5), p.get("updated_at") or p.get("created_at") or ""),
@@ -3079,8 +3091,8 @@ async def api_config_get(request: Request) -> Response:
 
 @mcp.custom_route("/api/config", methods=["POST"])
 async def api_config_update(request: Request) -> Response:
-    global embedding_engine
     """Hot-update runtime config. Optionally persist to config.yaml."""
+    global embedding_engine
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err:
@@ -3289,6 +3301,42 @@ async def api_test_dehydration(request: Request) -> Response:
 
 
 # =============================================================
+# /api/test/embedding — 测试向量化 Embedding 是否真的可用
+# 之前只有脱水(compress)能测，向量化无从验证 → 用户「压缩正常但向量化静默失败」
+# 时完全无感。这里实际发一次 embedding 请求，把成功/失败如实回给前端。(#2/#3)
+# =============================================================
+@mcp.custom_route("/api/test/embedding", methods=["POST"])
+async def api_test_embedding(request: Request) -> Response:
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    eng = embedding_engine  # 读全局（Fix: env-config 保存后已正确重建）
+    if not getattr(eng, "enabled", False) or getattr(eng, "_backend", None) is None:
+        return JSONResponse({
+            "ok": False,
+            "error": "向量化未启用或缺 key（standby）。请填入 Embedding API Key 点「保存」后再测。",
+        })
+    try:
+        vec = await eng._generate_async("connectivity probe / 连接性探针")
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
+    if vec:
+        model = getattr(eng, "model", "") or (
+            eng._backend.model_name() if getattr(eng, "_backend", None) else "?"
+        )
+        return JSONResponse({
+            "ok": True,
+            "message": f"向量化连接成功 ✓（模型 {model}，维度 {len(vec)}）",
+        })
+    return JSONResponse({
+        "ok": False,
+        "error": "调用返回空向量：检查 model 名 / base_url / key 是否匹配该 provider"
+                 "（如硅基流动 base_url=https://api.siliconflow.cn/v1、model=BAAI/bge-m3）。详见错误面板 OB-E001。",
+    })
+
+
+# =============================================================
 # /api/models — 获取 LLM provider 可用模型列表（供 Dashboard 模型选择器使用）
 # POST Body: {api_key, base_url, api_format}
 # 支持 openai_compat / gemini / anthropic 三种格式
@@ -3380,7 +3428,7 @@ _ENV_CONFIG_FIELDS: dict[str, dict] = {
 }
 
 _ENV_CONFIG_NOTE = {
-    "compress": "改完即时生效（进程内 config 已更新），同时写 .env 持久化（重启后仍有效）。",
+    "compress": "改完即时生效（进程内 config 已更新），同时写 config.yaml 持久化（重启后仍有效）。",
     "embed": "API key / base_url / model 立即更新进程内 config；backend 切换请用「切换 / 重算所有 embedding…」按钮。",
     "webhook": "改完下次 breath/dream 触发时即生效，无需重启。",
 }
@@ -3445,6 +3493,12 @@ async def api_env_config_set(request: Request) -> Response:
 
     成功返回 {ok, updated: [已写的变量名], .env 路径}。
     """
+    # 必须声明 global：下面第 6 步会 `embedding_engine = EmbeddingEngine(config)` 重建实例。
+    # 缺这行 → 该赋值把 embedding_engine 当函数局部变量，造成：
+    #   1) 清 key 分支 `embedding_engine._backend = None` 触发 UnboundLocalError（被 except 吞掉 → 清 key 没真禁用）；
+    #   2) 设新 key 时只更新局部，模块级全局仍指向旧引擎 → /api/embedding/info、search 等读全局处拿到旧/待机引擎，
+    #      表现为「在 Dashboard 配了硅基流动等向量化却一直静默不生效」。
+    global embedding_engine
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err:
@@ -3569,7 +3623,7 @@ async def api_env_config_set(request: Request) -> Response:
         "ok": True,
         "updated": written,
         "env_file": _project_env_path(),
-        "note": "已同时更新进程内 config 和 .env 文件。敏感字段（API key）重启后仍有效。",
+        "note": "已同时更新进程内 config 和 config.yaml 文件。敏感字段（API key）重启后仍有效。",
     }
     if errors:
         response["warnings"] = errors
@@ -4056,7 +4110,7 @@ async def api_bucket_edit(request: Request) -> Response:
         updates["content"] = new_content
 
     # type 字段直接改（不经 pinned 联动，调用方自己负责一致性）
-    _valid_types = {"dynamic", "permanent", "feel", "plan", "letter", "self"}
+    _valid_types = {"dynamic", "permanent", "feel", "plan", "letter", "i"}
     if isinstance(body.get("type"), str) and body["type"] in _valid_types:
         if body["type"] != bucket["metadata"].get("type"):
             updates["type"] = body["type"]
@@ -4334,19 +4388,35 @@ async def api_do_update(request: Request) -> Response:
             await _asyncio.sleep(0.1)
 
             zip_bytes = r.content
+            # 目标根目录从 __file__ 推算，而不是写死 /app —— 否则裸机 / VPS / pm2
+            # 等非 Docker 部署会把新文件写进不存在的 /app，真正运行的代码没更新，
+            # 紧接着 os._exit(0) 又把进程杀了（无 restart 策略时不会自动拉起）。
+            # Docker 下 __file__=/app/src/server.py，算出来仍是 /app/src、/app/frontend，
+            # 与原硬编码一致，对现有 Docker 部署零影响。
+            _repo_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            src_root      = _os.path.join(_repo_root, "src")
+            frontend_root = _os.path.join(_repo_root, "frontend")
             with _zipfile.ZipFile(_io.BytesIO(zip_bytes)) as zf:
                 # GitHub archive root: "Ombre-Brain-main/"
                 prefix_src      = "Ombre-Brain-main/src/"
                 prefix_frontend = "Ombre-Brain-main/frontend/"
                 updated = 0
+                skipped = 0
                 for member in zf.namelist():
                     for prefix, dest_root in [
-                        (prefix_src,      "/app/src"),
-                        (prefix_frontend, "/app/frontend"),
+                        (prefix_src,      src_root),
+                        (prefix_frontend, frontend_root),
                     ]:
                         if member.startswith(prefix):
                             rel  = member[len(prefix):]
                             dest = _os.path.join(dest_root, rel)
+                            # Zip-Slip 防护：解压后路径必须仍在目标根目录内，
+                            # 防止恶意/损坏的 zip 用 ../ 写到任意位置（与 utils.safe_path 同理）。
+                            _root_abs = _os.path.abspath(dest_root)
+                            _dest_abs = _os.path.abspath(dest)
+                            if _dest_abs != _root_abs and not _dest_abs.startswith(_root_abs + _os.sep):
+                                skipped += 1
+                                continue
                             if member.endswith("/"):
                                 _os.makedirs(dest, exist_ok=True)
                             else:
@@ -4355,6 +4425,8 @@ async def api_do_update(request: Request) -> Response:
                                     with open(dest, "wb") as df:
                                         df.write(sf.read())
                                 updated += 1
+                if skipped:
+                    yield f"data: 已跳过 {skipped} 个路径异常的条目（安全防护）…\n\n"
 
             yield f"data: 已更新 {updated} 个文件，即将重启服务…\n\n"
             await _asyncio.sleep(0.5)
